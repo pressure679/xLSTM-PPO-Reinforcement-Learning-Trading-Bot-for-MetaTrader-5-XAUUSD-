@@ -1711,7 +1711,7 @@ def test_bot(symbol="XAUUSD"):
         now = datetime.now()
 
         seconds_until_next_5m = (
-            300
+            (5 - now.minte % 5) * 60
             - now.second
             - now.microsecond / 1_000_000
         )

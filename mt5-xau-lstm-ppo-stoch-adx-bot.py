@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 # import requests
 # import threading
 # from multiprocessing import Process
-# import time
+import time
 # from time import timezone
 # from decimal import Decimal
 # from pybit.unified_trading import HTTP
@@ -21,6 +21,10 @@ from datetime import datetime, timedelta
 # import glob
 # import shutil
 import MetaTrader5 as mt5
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
 
 # ready_event = threading.Event()
 # process_counter = 0
@@ -30,7 +34,7 @@ ACTIONS = ['hold', 'long', 'short', 'close']
 
 # capital = 800
 
-def load_last_mb_xauusd(file_path="C:\\Users\\Vittus Mikiassen\\Desktop\\XAU_15m_data.csv", mb=7, delimiter=';', col_names=None):
+def load_last_mb_xauusd(file_path="C:\\Users\\Vittus Mikiassen\\Desktop\\XAU_5m_data.csv", mb=15, delimiter=';', col_names=None):
     file_size = os.path.getsize(file_path)
     offset = max(file_size - mb * 1024 * 1024, 0)  # start position
     
@@ -104,6 +108,9 @@ def ADX(df, period=14):
 
     dx  = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di)
     adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    adx = round(adx , 2)
+    plus_di = round(plus_di, 2)
+    minus_di = round(minus_di, 2)
 
     return adx, plus_di, minus_di
 
@@ -129,10 +136,13 @@ def STOCH(df, period=14, smooth_d=3):
     # --- %D (smoothed %K) ---------------------------------------------
     d = k.rolling(window=smooth_d).mean()
 
+    k = round(k, 2)
+    d = round(d, 2)
+
     return k, d
 
 def EMA(df, period):
-    return df['Close'].ewm(span=period, adjust=False).mean()
+    return df['Close'].ewm(span=period, adjust=False).mean().round(2)
 
 def add_indicators(df):
     df['adx'], df['+di'], df['-di'] = ADX(df)
@@ -147,325 +157,376 @@ def add_indicators(df):
     # df = df[["Open", "High", "Low", "Close", "EMA_crossover", "macd_zone", "macd_line", "macd_signal", "macd_line_diff", "macd_signal_diff", "macd_line_slope", "macd_signal_line_slope" , "macd_osma", "macd_crossover", "bb_sma", "bb_upper", "bb_lower", "RSI_zone", "ADX_zone", "+DI_val", "-DI_val", "ATR", "order_block_type"]].copy()
 
     df.dropna(inplace=True)
+    # print(df.isna().sum())
     # ready_event.set()
     return df
 
+class PPOLSTMNetwork(nn.Module):
+    def __init__(self, state_size=12, hidden_size=64, action_size=3):
+        super().__init__()
+
+        self.lstm = nn.LSTM(
+            input_size=state_size,
+            hidden_size=hidden_size,
+            batch_first=True
+        )
+
+        self.policy = nn.Sequential(
+            nn.Linear(hidden_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, action_size)
+        )
+
+        self.value = nn.Sequential(
+            nn.Linear(hidden_size, 64),
+            nn.ReLU(),
+            nn.Linear(64, 1)
+        )
+
+        # self.debug = False
+
+    def forward(self, x):
+        """
+        if self.debug:
+            print("x shape before lstm:", x.shape)
+
+        if x.shape[1] == 0:
+            print("ERROR: zero sequence length")
+            print("x shape:", x.shape)
+            raise ValueError("Zero sequence length")
+        """
+
+        out, _ = self.lstm(x)
+        h = out[:, -1, :]
+
+        logits = self.policy(h)
+        value = self.value(h).squeeze(-1)
+
+        return logits, value
+
 class LSTMPPOAgent:
-    def __init__(self, state_size, hidden_size, action_size, lr=1e-3, gamma=0.95, clip_ratio=0.2):
+    def __init__(
+        self,
+        state_size,
+        hidden_size,
+        action_size,
+        lr=3e-4,
+        gamma=0.95,
+        clip_ratio=0.2,
+        gae_lambda=0.95
+    ):
         self.state_size = state_size
         self.hidden_size = hidden_size
         self.action_size = action_size
-        self.lr = lr
+
         self.gamma = gamma
         self.clip_ratio = clip_ratio
-        self.train_epochs = 5
-        self.batch_size = 32
+        self.gae_lambda = gae_lambda
+
+        self.train_epochs = 10
+        self.batch_size = 64
         self.entropy_coef = 0.01
+        self.value_coef = 0.5
 
-        # Initialize weights
-        self.model = {
-            # LSTM
-            'Wx': np.random.randn(4 * hidden_size, state_size) * 0.1,
-            'Wh': np.random.randn(4 * hidden_size, hidden_size) * 0.1,
-            'b': np.zeros(4 * hidden_size),
+        self.device = torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
-            # Policy head
-            'W_policy': np.random.randn(action_size, hidden_size) * 0.1,
-            'W_policy_2': np.random.randn(1, hidden_size) * 0.1,
-            'b_policy': np.zeros(action_size),
-            'b_policy_2': np.zeros(1),
+        self.model = PPOLSTMNetwork(
+            state_size,
+            hidden_size,
+            action_size
+        ).to(self.device)
 
-            # Value head
-            'W_value': np.random.randn(1, hidden_size) * 0.1,
-            'b_value': np.zeros(1),
-        }
+        self.optimizer = torch.optim.Adam(
+            self.model.parameters(),
+            lr=lr
+        )
 
-        self.reset_state()
         self.trajectory = []
 
-    def reset_state(self):
-        self.h = np.zeros((self.hidden_size,))
-        self.c = np.zeros((self.hidden_size,))
+    def _state_tensor(self, state_seq):
+        return torch.tensor(
+            state_seq,
+            dtype=torch.float32,
+            device=self.device
+        ).unsqueeze(0)
 
-    def sigmoid(self, x):
-        return 1 / (1 + np.exp(-np.clip(x, -50, 50)))  # prevent overflow
+    def select_action(self, state_seq, in_position=False, training=False):
 
-    def tanh(self, x):
-        return np.tanh(x)
+        state = self._state_tensor(state_seq)
 
-    def softmax(self, x):
-        exps = np.exp(x - np.max(x))
-        return exps / np.sum(exps)
+        # if training is False:
+        #     print("state type:", type(state))
+        #     print("state shape:", state.shape if hasattr(state, "shape") else "no shape")
 
-    def lstm_forward(self, x_seq):
-        h, c = self.h.copy(), self.c.copy()
-        for x in x_seq:
-            x = np.asarray(x).reshape(-1)  # ensure shape (state_size,)
-            assert x.shape[0] == self.state_size, f"x shape {x.shape} does not match state_size {self.state_size}"
-            z = np.dot(self.model['Wx'], x) + np.dot(self.model['Wh'], h) + self.model['b']
-            i = self.sigmoid(z[0:self.hidden_size])
-            f = self.sigmoid(z[self.hidden_size:2*self.hidden_size])
-            o = self.sigmoid(z[2*self.hidden_size:3*self.hidden_size])
-            g = self.tanh(z[3*self.hidden_size:])
-            c = f * c + i * g
-            h = o * self.tanh(c)
-        self.h, self.c = h, c
-        return h
+        with torch.no_grad():
+            logits, value = self.model(state)
 
-    def forward(self, x_seq):
-        h = self.lstm_forward(x_seq)
-        logits = np.dot(self.model['W_policy'], h) + self.model['b_policy']
-        value = np.dot(self.model['W_value'], h) + self.model['b_value']
-        probs = self.softmax(logits)
-        return probs, value[0]
+        logits = logits.squeeze(0)
 
-    def sl_tp_forward(self, x_seq):
-        h = self.lstm_forward(x_seq)
-        # logits = np.dot(self.model['W_policy'], h) + self.model['b_policy']
-        logits = np.dot(self.model['W_policy_2'], h) + self.model['b_policy_2']
-        # probs = self.softmax(logits)
-        value = np.dot(self.model['W_value'], h) + self.model['b_value']
-        continuous_action = self.sigmoid(logits)
-        # return probs, value[0]
-        return continuous_action, value[0] # (tp_raw, sl_raw)
+        if in_position:
+            valid_actions = [0]
+        else:
+            valid_actions = [0, 1, 2]
 
-    def scale_action(self, tp_raw, sl_raw):
-        tp_min, tp_max = 0.0002, 0.002  # 0.5% to 5%, 0.2% to 2% with 50x leverage
-        sl_min, sl_max = 0.0001, 0.001 # 0.2% to 3%, 
-        tp_pct = tp_min + (tp_max - tp_min) * tp_raw
-        sl_pct = sl_min + (sl_max - sl_min) * sl_raw
-        return tp_pct, sl_pct
+        masked_logits = logits.clone()
 
-    def select_action(self, state_seq, in_position):
-        valid_actions = []
-        try:
-            logits, value = self.forward(state_seq)
+        for i in range(self.action_size):
+            if i not in valid_actions:
+                masked_logits[i] = -1e9
 
-            # Convert logits to probabilities using softmax
-            max_logit = np.max(logits)
-            exp_logits = np.exp(logits - max_logit)
-            probs = exp_logits / np.sum(exp_logits)
+        probs = torch.softmax(masked_logits, dim=-1)
 
-            # Handle invalid probabilities
-            if np.any(np.isnan(probs)) or np.sum(probs) == 0:
-                # print("⚠️ Warning: NaN or zero-sum probabilities. Using uniform distribution.")
-                probs = np.ones(self.action_size) / self.action_size
+        dist = Categorical(probs)
 
-            probs = probs / np.sum(probs)  # Normalize again just in case
+        if training:
+            action = dist.sample()
+        else:
+            action = torch.argmax(probs)
 
-            if np.argmax(probs) >= 0.9:
-                action = np.argmax(probs)
-                logprob = np.log(probs[action] + 1e-8)
-            else:
-                action = np.random.choice(self.action_size, p=probs)
-                logprob = np.log(probs[action] + 1e-8)
+        logprob = dist.log_prob(action)
 
-            # if in_position:
-            #     action = 0
-            if in_position:
-                valid_actions = [0, 1]  # Hold or Close
-            else:
-                valid_actions = [0, 2, 3]  # Hold, Long, Short
-                
-            # Mask invalid actions:
-            masked_probs = np.array([probs[a] if a in valid_actions else 0 for a in range(self.action_size)])
-            if masked_probs.sum() == 0:
-                masked_probs = np.ones(self.action_size) / self.action_size
-            else:
-                masked_probs = masked_probs / masked_probs.sum()
-                    
-            if np.argmax(masked_probs) >= 0.9:
-                action = np.argmax(masked_probs)
-            else:
-                action = np.random.choice(self.action_size, p=masked_probs)
-            logprob = np.log(masked_probs[action] + 1e-8)
+        """
+        print(
+            f"H={probs[0]:.2f} "
+            f"B={probs[1]:.2f} "
+            f"S={probs[2]:.2f}"
+        )
+        """
 
-            # if last_ema_crossover == current_ema_crossover:
-            #     action = 0
+        return (
+            int(action.item()),
+            float(logprob.item()),
+            float(value.item())
+        )
 
-            return action, logprob, value
-        except Exception as e:
-            # print(f"❌ select_action error: {e}")
-            return None
+    def store_transition(
+        self,
+        state_seq,
+        action,
+        logprob,
+        value,
+        reward,
+        done
+    ):
+        self.trajectory.append(
+            (
+                np.array(state_seq, dtype=np.float32),
+                action,
+                logprob,
+                value,
+                reward,
+                done
+            )
+        )
 
-    def store_transition(self, state_seq, action, logprob, value, reward, done):
-        self.trajectory.append((state_seq, action, logprob, value, reward, done))
+    def compute_gae(self, rewards, values, dones):
 
-    def store_reward(self, reward):
-        if self.trajectory:
-            last = self.trajectory[-1]
-            self.trajectory[-1] = (*last, reward)
-
-    def _discount_rewards(self, rewards):
-        discounted = []
-        R = 0
-        for r in reversed(rewards):
-            R = r + self.gamma * R
-            discounted.insert(0, R)
-        return discounted
-
-    def update_policy_and_value(self, states_seq, actions, old_action_probs, advantages, returns, lr=1e-3, epsilon=0.1):
-        for i in range(len(states_seq)):
-            state_seq = states_seq[i]
-            action = actions[i]
-            old_prob = old_action_probs[i]
-            advantage = advantages[i]
-            target_value = returns[i]
-
-            # Initialize LSTM hidden state
-            h = np.zeros((self.hidden_size, 1))
-
-            # Forward pass through LSTM for the state sequence
-            for x in state_seq:
-                x = np.array(x, dtype=np.float32).reshape(self.state_size, 1)
-                z = np.dot(self.model['Wx'], x) + np.dot(self.model['Wh'], h) + self.model['b'].reshape(-1, 1)
-                # LSTM gates split
-                i_gate = self.sigmoid(z[0:self.hidden_size])
-                f_gate = self.sigmoid(z[self.hidden_size:2*self.hidden_size])
-                o_gate = self.sigmoid(z[2*self.hidden_size:3*self.hidden_size])
-                g_gate = np.tanh(z[3*self.hidden_size:4*self.hidden_size])
-
-                # LSTM cell state update (you might want to maintain c state if you have it, here simplified)
-                c = f_gate * np.zeros_like(h) + i_gate * g_gate  # Assume c initialized as zeros for simplicity
-                h = o_gate * np.tanh(c)
-
-            # Policy logits and probabilities
-            logits = np.dot(self.model['W_policy'], h) + self.model['b_policy'].reshape(-1, 1)
-            probs = self.softmax(logits.flatten())
-            new_prob = probs[action]
-
-            # Value prediction
-            value = (np.dot(self.model['W_value'], h) + self.model['b_value']).item()
-
-            # Value loss gradient
-            v_error = value - target_value
-            grad_W_value = v_error * h.T
-            grad_b_value = v_error
-
-            # PPO policy loss gradient
-            ratio = new_prob / (old_prob + 1e-10)
-            clipped_ratio = np.clip(ratio, 1 - epsilon, 1 + epsilon)
-            policy_grad_coef = -min(ratio * advantage, clipped_ratio * advantage)
-
-            grad_logits = probs.copy()
-            grad_logits[action] -= 1  # dSoftmax cross-entropy grad
-            grad_logits *= policy_grad_coef
-
-            grad_W_policy = np.dot(grad_logits.reshape(-1, 1), h.T)
-            grad_b_policy = grad_logits.reshape(-1, 1)
-
-            # Gradient descent update
-            self.model['W_policy'] -= lr * grad_W_policy
-            self.model['b_policy'] -= lr * grad_b_policy.flatten()
-            self.model['W_value'] -= lr * grad_W_value
-            self.model['b_value'] -= lr * grad_b_value
-
-    def ppo_policy_loss(self, old_probs, new_probs, advantages, epsilon=0.1):
-        old_probs = np.array(old_probs)
-        new_probs = np.array(new_probs)
-        advantages = np.array(advantages)
-        
-        ratios = new_probs / (old_probs + 1e-10)
-        clipped = np.clip(ratios, 1 - epsilon, 1 + epsilon)
-        loss = -np.mean(np.minimum(ratios * advantages, clipped * advantages))
-        return loss
-    def value_loss(self, values, returns):
-        values = np.array(values)
-        returns = np.array(returns)
-        return 0.5 * np.mean((returns - values) ** 2)
-
-    def compute_gae(self, rewards, values, dones, gamma=0.95, lam=0.95):
         advantages = []
         gae = 0
-        values = np.append(values, 0)  # Bootstrap value after last step
-        
-        for step in reversed(range(len(rewards))):
-            delta = rewards[step] + gamma * values[step + 1] * (1 - dones[step]) - values[step]
-            gae = delta + gamma * lam * (1 - dones[step]) * gae
+
+        values = np.append(values, 0.0)
+
+        for t in reversed(range(len(rewards))):
+
+            delta = (
+                rewards[t]
+                + self.gamma * values[t + 1] * (1 - dones[t])
+                - values[t]
+            )
+
+            gae = (
+                delta
+                + self.gamma
+                * self.gae_lambda
+                * (1 - dones[t])
+                * gae
+            )
+
             advantages.insert(0, gae)
-        return np.array(advantages)
+
+        return np.array(advantages, dtype=np.float32)
 
     def train(self):
-        # if len(self.trajectory) < 2:
-        #     return  # Not enough data to train
-        if self.trajectory:
-            # Unpack trajectory
-            states, actions, logprobs_old, values, rewards, dones = zip(*self.trajectory)
 
-            # Convert to arrays
-            values = np.array(values)
-            rewards = np.array(rewards)
-
-            # Normalize rewards
-            rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
-
-            # Compute GAE
-            advantages = self.compute_gae(rewards, values, dones, gamma=0.95, lam=0.95)
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # Normalize advantages
-            returns = advantages + values
-
-            # Clip returns and values
-            returns = np.clip(returns, -1000, 1000)
-            values = np.clip(values, -1000, 1000)
-            advantages = np.clip(advantages, -10, 10)
-
-            # Train for multiple epochs (optional)
-            for _ in range(self.train_epochs):
-                for i in range(len(states)):
-                    state_seq = states[i]
-                    action = actions[i]
-                    old_logprob = logprobs_old[i]
-                    # print(f"len(states): {len(states)}")
-                    # print(f"len(actions): {len(actions)}")
-                    # print(f"len(logprobs_old): {len(logprobs_old)}")
-                    # print(f"len(values): {len(values)}")
-                    # print(f"len(rewards): {len(rewards)}")
-                    # print(f"len(dones): {len(dones)}")
-                    # print(f"length of advantages: {len(advantages)}, i: {i}, length of states: {len(states)}")
-                    advantage = advantages[i]
-                    target_value = returns[i]
-
-                    # Forward pass
-                    probs, value = self.forward(state_seq)
-
-                    # Entropy bonus
-                    entropy = -np.sum(probs * np.log(probs + 1e-8))
-
-                    # Policy loss
-                    logprob = np.log(probs[action] + 1e-8)
-                    ratio = np.exp(logprob - old_logprob)
-                    clipped_ratio = np.clip(ratio, 1 - self.clip_ratio, 1 + self.clip_ratio)
-                    policy_loss = -min(ratio * advantage, clipped_ratio * advantage)
-
-                    # Value loss
-                    v_loss = 0.5 * ((target_value - value) ** 2)
-
-                    # Total loss
-                    loss = policy_loss + 0.5 * v_loss - 0.01 * entropy
-
-                    # Gradient descent step (simplified)
-                    for k in self.model:
-                        self.model[k] -= self.lr * loss
-                        self.model[k] = np.clip(self.model[k], -1000, 1000)  # Clamp weights
-
-                self.trajectory.clear()
-
-    def savecheckpoint(self, symbol):
-        os.makedirs("LSTM-PPO-saves", exist_ok=True)
-        filename = f"LSTM-PPO-saves/{datetime.now().strftime('%Y-%m-%d')}-{symbol}.checkpoint.lstm-ppo.pkl"
-        with open(filename, 'wb') as f:
-            pickle.dump(self.model, f)
-
-    def loadcheckpoint(self, symbol):
-        files = sorted(os.listdir("LSTM-PPO-saves"))
-        files = [f for f in files if f.endswith(".checkpoint.lstm-ppo.pkl") and symbol in f]
-        if not files:
-            print(f"[!] No checkpoint found for {symbol}")
+        if len(self.trajectory) < 32:
             return
 
-        latest = os.path.join("LSTM-PPO-saves", files[-1])
-        with open(latest, "rb") as f:
-            self.model = pickle.load(f)
+        states, actions, old_logprobs, values, rewards, dones = zip(
+            *self.trajectory
+        )
+
+        states = np.array(states, dtype=np.float32)
+        actions = np.array(actions)
+        old_logprobs = np.array(old_logprobs, dtype=np.float32)
+        values = np.array(values, dtype=np.float32)
+        rewards = np.array(rewards, dtype=np.float32)
+        dones = np.array(dones, dtype=np.float32)
+
+        advantages = self.compute_gae(
+            rewards,
+            values,
+            dones
+        )
+
+        returns = advantages + values
+
+        advantages = (
+            advantages - advantages.mean()
+        ) / (advantages.std() + 1e-8)
+
+        states = torch.tensor(
+            states,
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        actions = torch.tensor(
+            actions,
+            dtype=torch.long,
+            device=self.device
+        )
+
+        old_logprobs = torch.tensor(
+            old_logprobs,
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        returns = torch.tensor(
+            returns,
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        advantages = torch.tensor(
+            advantages,
+            dtype=torch.float32,
+            device=self.device
+        )
+
+        n = len(states)
+
+        for _ in range(self.train_epochs):
+
+            idx = torch.randperm(n, device=self.device)
+
+            for start in range(0, n, self.batch_size):
+
+                batch_idx = idx[start:start+self.batch_size]
+
+                b_states = states[batch_idx]
+                b_actions = actions[batch_idx]
+                b_old_logprobs = old_logprobs[batch_idx]
+                b_returns = returns[batch_idx]
+                b_advantages = advantages[batch_idx]
+
+                logits, values_pred = self.model(b_states)
+
+                dist = Categorical(logits=logits)
+
+                new_logprobs = dist.log_prob(
+                    b_actions
+                )
+
+                entropy = dist.entropy().mean()
+
+                ratio = torch.exp(
+                    new_logprobs - b_old_logprobs
+                )
+
+                surr1 = ratio * b_advantages
+
+                surr2 = torch.clamp(
+                    ratio,
+                    1 - self.clip_ratio,
+                    1 + self.clip_ratio
+                ) * b_advantages
+
+                policy_loss = -torch.min(
+                    surr1,
+                    surr2
+                ).mean()
+
+                value_loss = F.mse_loss(
+                    values_pred,
+                    b_returns
+                )
+
+                loss = (
+                    policy_loss
+                    + self.value_coef * value_loss
+                    - self.entropy_coef * entropy
+                )
+
+                self.optimizer.zero_grad()
+                loss.backward()
+
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(),
+                    1.0
+                )
+
+                self.optimizer.step()
+
+        self.trajectory.clear()
+
+    def savecheckpoint(self, symbol):
+
+        os.makedirs(
+            "LSTM-PPO-saves",
+            exist_ok=True
+        )
+
+        filename = (
+            f"LSTM-PPO-saves/"
+            f"{datetime.now().strftime('%Y-%m-%d')}-"
+            f"{symbol}.checkpoint.pt"
+        )
+
+        torch.save(
+            {
+                "model": self.model.state_dict(),
+                "optimizer": self.optimizer.state_dict()
+            },
+            filename
+        )
+
+    def loadcheckpoint(self, symbol):
+
+        if not os.path.exists("LSTM-PPO-saves"):
+            return
+
+        files = sorted(
+            [
+                f for f in os.listdir("LSTM-PPO-saves")
+                if f.endswith(".checkpoint.pt")
+                and symbol in f
+            ]
+        )
+
+        if not files:
+            return
+
+        latest = os.path.join(
+            "LSTM-PPO-saves",
+            files[-1]
+        )
+
+        checkpoint = torch.load(
+            latest,
+            map_location=self.device
+        )
+
+        self.model.load_state_dict(
+            checkpoint["model"]
+        )
+
+        if "optimizer" in checkpoint:
+            self.optimizer.load_state_dict(
+                checkpoint["optimizer"]
+            )
 
 class WinRateKNN:
     def __init__(self, symbol, k=10):
@@ -661,9 +722,12 @@ def max_drawdown(returns):
 
     return max_dd
 
-def train_bot(df, symbol="XAUUSD"):
+def train_bot(symbol="XAUUSD"):
 
-    SEQ_LEN = 32
+    df = load_last_mb_xauusd()
+    df = add_indicators(df)
+
+    SEQ_LEN = 12 * 3
 
     FEATURES = [
         "Open",
@@ -683,7 +747,7 @@ def train_bot(df, symbol="XAUUSD"):
     agent = LSTMPPOAgent(
         state_size=len(FEATURES),
         hidden_size=64,
-        action_size=4
+        action_size=3
     )
 
     # knn = WinRateKNN(symbol)
@@ -700,9 +764,9 @@ def train_bot(df, symbol="XAUUSD"):
     in_position = False
     position_type = None
 
-    # entry_price = 0
-    # sl_price = 0
-    # tp_price = 0
+    entry_price = 0
+    sl_price = 0
+    tp_price = 0
 
     entry_price = 0
     sl_price = 0
@@ -727,7 +791,7 @@ def train_bot(df, symbol="XAUUSD"):
     trade_returns = []
 
     # STANDARD_SL_PIPS = 100
-    # RR_RATIO = 2.0
+    RR_RATIO = 0.2
     # SPREAD_AND_COMMISSION = 1.2
 
     # SL_PIPS = 50
@@ -739,8 +803,7 @@ def train_bot(df, symbol="XAUUSD"):
 
     PIP_VALUE = 0.1
 
-    SPREAD_AND_COMMISSION = 1.2
-
+    SPREAD_AND_COMMISSION = 0
 
     state_buffer = deque(maxlen=SEQ_LEN)
 
@@ -756,13 +819,16 @@ def train_bot(df, symbol="XAUUSD"):
         current_price = current["Close"]
         high = current["High"]
         low = current["Low"]
-        SL_PIPS = round(current_price * 0.00125 * 10, 0)
-        # SL_PIPS = 50
-        TP1_PIPS = SL_PIPS
-        TP2_PIPS = round(SL_PIPS * 2, 0)
-        TP3_PIPS = round(SL_PIPS * 3, 0)
-        TP4_PIPS = round(SL_PIPS * 4, 0)
-        SL_MOVE_BUFFER = round(SL_PIPS / 3, 0)
+        # SL_PIPS = round(current_price * 0.00125 * 10, 0)
+        SL_PIPS = 50
+        TP1_PIPS = round(SL_PIPS * 0.2, 0)
+        # TP2_PIPS = round(SL_PIPS * 2, 0)
+        # TP3_PIPS = round(SL_PIPS * 3, 0)
+        # TP4_PIPS = round(SL_PIPS * 4, 0)
+        # SL_MOVE_BUFFER = round(SL_PIPS / 7, 0)
+        # SL_PIPS = 30
+        # TP1_PIPS = 100
+        # TP2_PIPS = 200
 
         state = current[FEATURES].values.astype(np.float32)
 
@@ -774,52 +840,62 @@ def train_bot(df, symbol="XAUUSD"):
         state_seq = np.array(state_buffer)
 
         # === Select action ============================================
-        result = agent.select_action(state_seq, in_position)
+        result = agent.select_action(state_seq, in_position, training=True)
 
         if result is None:
             continue
 
         action, logprob, value = result
 
-        reward = 0
+        if df["adx"].iloc[i] < 20:
+            action = 0
+
+        pnl = 0.0
+        reward = 0.0
         done = False
+
+        # if action == 0 and in_position:
+        #     if position_type == "long":
+        #         reward = round((current_price - entry_price) * 10, 0)
 
         # ==============================================================
         # OPEN LONG
         # ==============================================================
 
-        if action == 2 and not in_position:
+        if action == 1 and not in_position and df["+di"].iloc[i] > df["-di"].iloc[i] and df["EMA_DIFF"].iloc[i] > 0 and df["k"].iloc[i] < 80:
 
             in_position = True
             position_type = "long"
 
-            # entry_price = current_price
+            entry_price = current_price
 
-            # sl_price = entry_price - (STANDARD_SL_PIPS * 0.1)
-            # tp_price = entry_price + (
-            #     STANDARD_SL_PIPS * RR_RATIO * 0.1
-            # )
+            sl_price = entry_price - (SL_PIPS * 0.1)
+            tp_price = entry_price + (
+                SL_PIPS * RR_RATIO * 0.1
+            )
 
             entry_price = current_price
 
             sl_price = entry_price - (SL_PIPS * PIP_VALUE)
 
             tp1_price = entry_price + (TP1_PIPS * PIP_VALUE)
-            tp2_price = entry_price + (TP2_PIPS * PIP_VALUE)
-            tp3_price = entry_price + (TP3_PIPS * PIP_VALUE)
-            tp4_price = entry_price + (TP4_PIPS * PIP_VALUE)
+            # tp2_price = entry_price + (TP2_PIPS * PIP_VALUE)
+            # tp3_price = entry_price + (TP3_PIPS * PIP_VALUE)
+            # tp4_price = entry_price + (TP4_PIPS * PIP_VALUE)
 
             position_size = 1.0
             realized_reward = 0.0
+            pnl = 0.0
+            reward = 0.0
 
             tp1_hit = False
-            tp2_hit = False
-            tp3_hit = False
-            tp4_hit = False
+            # tp2_hit = False
+            # tp3_hit = False
+            # tp4_hit = False
 
-            tp1_sl_moved = False
-            tp2_sl_moved = False
-            tp3_sl_moved = False
+            # tp1_sl_moved = False
+            # tp2_sl_moved = False
+            # tp3_sl_moved = False
 
             # print('opened long')
 
@@ -827,44 +903,49 @@ def train_bot(df, symbol="XAUUSD"):
         # OPEN SHORT
         # ==============================================================
 
-        elif action == 3 and not in_position:
+        elif action == 2 and not in_position and df["-di"].iloc[i] > df["+di"].iloc[i] and df["EMA_DIFF"].iloc[i] < 0 and df["k"].iloc[i] > 20:
 
             in_position = True
             position_type = "short"
 
-            # entry_price = current_price
+            entry_price = current_price
 
-            # sl_price = entry_price + (STANDARD_SL_PIPS * 0.1)
-            # tp_price = entry_price - (
-            #     STANDARD_SL_PIPS * RR_RATIO * 0.1
-            # )
+            sl_price = entry_price + (SL_PIPS * 0.1)
+            tp_price = entry_price - (
+                SL_PIPS * RR_RATIO * 0.1
+            )
 
             entry_price = current_price
 
             sl_price = entry_price + (SL_PIPS * PIP_VALUE)
 
             tp1_price = entry_price - (TP1_PIPS * PIP_VALUE)
-            tp2_price = entry_price - (TP2_PIPS * PIP_VALUE)
-            tp3_price = entry_price - (TP3_PIPS * PIP_VALUE)
-            tp4_price = entry_price - (TP4_PIPS * PIP_VALUE)
+            # tp2_price = entry_price - (TP2_PIPS * PIP_VALUE)
+            # tp3_price = entry_price - (TP3_PIPS * PIP_VALUE)
+            # tp4_price = entry_price - (TP4_PIPS * PIP_VALUE)
 
             position_size = 1.0
             realized_reward = 0.0
+            reward = 0.0
+            pnl = 0.0
 
             tp1_hit = False
-            tp2_hit = False
-            tp3_hit = False
-            tp4_hit = False
+            # tp2_hit = False
+            # tp3_hit = False
+            # tp4_hit = False
 
-            tp1_sl_moved = False
-            tp2_sl_moved = False
-            tp3_sl_moved = False
+            # tp1_sl_moved = False
+            # tp2_sl_moved = False
+            # tp3_sl_moved = False
 
             # print('opened short')
 
         # ==============================================================
         # MANAGE POSITION
         # ==============================================================
+        if not in_position:
+            done = False
+
         if in_position:
 
             trade_closed = False
@@ -877,39 +958,54 @@ def train_bot(df, symbol="XAUUSD"):
 
                 if not tp1_hit and high >= tp1_price:
 
-                    realized_reward += SL_PIPS
+                    # realized_reward += SL_PIPS - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * 0.2 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * 0.2 - SPREAD_AND_COMMISSION
                     position_size -= 0.25
 
                     tp1_hit = True
 
-                    # sl_price = entry_price
+                    sl_price = entry_price
+                    trade_closed = True
 
+                    # print(f"tp1 hit, +{SL_PIPS - SPREAD_AND_COMMISSION:.0f}")
+                """
                 if not tp2_hit and high >= tp2_price:
 
-                    realized_reward += SL_PIPS * 2
+                    # realized_reward += SL_PIPS * 2 - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * 2 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * 2 - SPREAD_AND_COMMISSION
                     position_size -= 0.25
 
                     tp2_hit = True
 
-                    # sl_price = tp1_price
-
+                    sl_price = tp1_price
+                    # print(f"tp2 hit, +{SL_PIPS * 2 - SPREAD_AND_COMMISSION:.0f}")
+                    # trade_closed = True
+                
                 if not tp3_hit and high >= tp3_price:
 
-                    realized_reward += SL_PIPS * 3
+                    # realized_reward += SL_PIPS * 3 - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * 3 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * 3 - SPREAD_AND_COMMISSION
                     position_size -= 0.25
 
                     tp3_hit = True
 
-                    # sl_price = tp2_price
+                    sl_price = tp2_price
+                    # print(f"tp3 hit, +{SL_PIPS * 3 - SPREAD_AND_COMMISSION:.0f}")
 
                 if not tp4_hit and high >= tp4_price:
 
-                    realized_reward += SL_PIPS * 4
+                    # realized_reward += SL_PIPS * 4 - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * 4 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * 4 - SPREAD_AND_COMMISSION
 
-                    reward = realized_reward
+                    # reward = realized_reward
 
+                    # print(f"tp4 hit, +{SL_PIPS * 4 - SPREAD_AND_COMMISSION:.0f}")
                     trade_closed = True
-
+                """
                 if not trade_closed and low <= sl_price:
 
                     remaining_pips = (
@@ -917,18 +1013,27 @@ def train_bot(df, symbol="XAUUSD"):
                         / PIP_VALUE
                     )
 
-                    realized_reward += (
-                        remaining_pips * position_size
+                    # realized_reward += (
+                    # reward += (
+                    #     # remaining_pips * (position_size / 0.25) - SPREAD_AND_COMMISSION * (position_size / 0.25)
+                    #     remaining_pips - SPREAD_AND_COMMISSION * (position_size / 0.25)
+                    # )
+                    pnl += (
+                        remaining_pips * (position_size) - SPREAD_AND_COMMISSION * (position_size)
+                        # remaining_pips - SPREAD_AND_COMMISSION * (position_size / 0.25)
                     )
 
-                    reward = realized_reward
-
+                    # print(f"sl hit, (+){remaining_pips * (position_size / 0.25) - SPREAD_AND_COMMISSION * (position_size / 0.25):.0f}")
+                    # print(f"remaining pips: {remaining_pips:.0f}, positions: {position_size / 0.25:.0f}")
+                    # reward = realized_reward
+                    # if sl_price < entry_price:
+                    #     realized_reward = (SL_PIPS * 2) * -1
                     trade_closed = True
-
+                """
                 # TP1 reached +10 pips
                 if tp1_hit and not tp1_sl_moved:
 
-                    if high >= tp1_price + (SL_MOVE_BUFFER / PIP_VALUE):
+                    if high >= tp1_price + (SL_MOVE_BUFFER * PIP_VALUE):
 
                         sl_price = tp1_price
 
@@ -937,21 +1042,21 @@ def train_bot(df, symbol="XAUUSD"):
                 # TP2 reached +10 pips
                 if tp2_hit and not tp1_sl_moved:
 
-                    if high >= tp2_price + (SL_MOVE_BUFFER / PIP_VALUE):
+                    if high >= tp2_price + (SL_MOVE_BUFFER * PIP_VALUE):
 
                         sl_price = tp2_price
 
                         tp2_sl_moved = True
                 
-                # TP1 reached +10 pips
+                # TP3 reached +10 pips
                 if tp3_hit and not tp3_sl_moved:
 
-                    if high >= tp3_price + (SL_MOVE_BUFFER / PIP_VALUE):
+                    if high >= tp3_price + (SL_MOVE_BUFFER * PIP_VALUE):
 
                         sl_price = tp3_price
 
                         tp3_sl_moved = True
-
+                """
             # ==================================================
             # SHORT
             # ==================================================
@@ -960,39 +1065,52 @@ def train_bot(df, symbol="XAUUSD"):
 
                 if not tp1_hit and low <= tp1_price:
 
-                    realized_reward += SL_PIPS
-                    position_size -= 0.25
+                    # realized_reward += SL_PIPS * 2 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * 0.2 - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * 0.2 - SPREAD_AND_COMMISSION
+                    # position_size -= 0.25
 
                     tp1_hit = True
 
-                    # sl_price = entry_price
-
+                    sl_price = entry_price
+                    trade_closed = True
+                    # print(f"tp1 hit, +{SL_PIPS - SPREAD_AND_COMMISSION:.0f}")
+                """
                 if not tp2_hit and low <= tp2_price:
 
-                    realized_reward += SL_PIPS * 2
+                    # realized_reward += SL_PIPS * 2 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * 2 - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * 2 - SPREAD_AND_COMMISSION
                     position_size -= 0.25
 
                     tp2_hit = True
 
-                    # sl_price = tp1_price
+                    # print(f"tp2 hit, +{SL_PIPS * 2 - SPREAD_AND_COMMISSION:.0f}")
+                    sl_price = tp1_price
+                    # realized_reward = 300 - SPREAD_AND_COMMISSION * 2
+                    # trade_closed = True
 
                 if not tp3_hit and low <= tp3_price:
 
-                    realized_reward += SL_PIPS * 3
+                    # realized_reward += SL_PIPS * 3 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * 3 - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * 3 - SPREAD_AND_COMMISSION
                     position_size -= 0.25
 
                     tp3_hit = True
-
-                    # sl_price = tp2_price
+                    # print(f"tp3 hit, +{SL_PIPS * 3 - SPREAD_AND_COMMISSION:.0f}")
+                    sl_price = tp2_price
 
                 if not tp4_hit and low <= tp4_price:
 
-                    realized_reward += SL_PIPS * 4
-
-                    reward = realized_reward
+                    # realized_reward += SL_PIPS * 4 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * 3 - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * 3 - SPREAD_AND_COMMISSION
+                    # print(f"tp4 hit, +{SL_PIPS * 4 - SPREAD_AND_COMMISSION:.0f}")
+                    # reward = realized_reward
 
                     trade_closed = True
-
+                """
                 if not trade_closed and high >= sl_price:
 
                     remaining_pips = (
@@ -1000,18 +1118,25 @@ def train_bot(df, symbol="XAUUSD"):
                         / PIP_VALUE
                     )
 
-                    realized_reward += (
-                        remaining_pips * position_size
+                    # realized_reward += (
+                    # reward += (
+                    #     remaining_pips - SPREAD_AND_COMMISSION * (position_size / 0.25)
+                    # )
+                    pnl += (
+                        remaining_pips * (position_size) - SPREAD_AND_COMMISSION * (position_size)
                     )
 
-                    reward = realized_reward
-
+                    # print(f"sl hit, (+){remaining_pips * (position_size / 0.25) - SPREAD_AND_COMMISSION * (position_size / 0.25):.0f}")
+                    # print(f"remaining pips: {remaining_pips:.0f}, positions: {position_size / 0.25:.0f}")
+                    # reward = realized_reward
+                    # if sl_price > entry_price:
+                    #     realized_reward = (SL_PIPS * 2) * -1
                     trade_closed = True
-
+                """
                 # TP1 reached +10 pips
                 if tp1_hit and not tp1_sl_moved:
 
-                    if low <= tp1_price + (SL_MOVE_BUFFER / PIP_VALUE):
+                    if low <= tp1_price - (SL_MOVE_BUFFER * PIP_VALUE):
 
                         sl_price = tp1_price
 
@@ -1020,7 +1145,7 @@ def train_bot(df, symbol="XAUUSD"):
                 # TP2 reached +10 pips
                 if tp2_hit and not tp1_sl_moved:
 
-                    if low <= tp2_price + (SL_MOVE_BUFFER / PIP_VALUE):
+                    if low <= tp2_price - (SL_MOVE_BUFFER * PIP_VALUE):
 
                         sl_price = tp2_price
 
@@ -1029,30 +1154,41 @@ def train_bot(df, symbol="XAUUSD"):
                 # TP1 reached +10 pips
                 if tp3_hit and not tp3_sl_moved:
 
-                    if low <= tp3_price + (SL_MOVE_BUFFER / PIP_VALUE):
+                    if low <= tp3_price - (SL_MOVE_BUFFER * PIP_VALUE):
 
                         sl_price = tp3_price
 
                         tp3_sl_moved = True
-
+                """
             if trade_closed:
 
                 in_position = False
+                done = True
+                # trade_returns.append(realized_reward)
+                trade_returns.append(pnl)
+                # print(
+                #     entry_price,
+                #     sl_price,
+                #     tp1_price,
+                #     tp2_price,
+                #     tp3_price,
+                #     tp4_price,
+                #     realized_reward
+                # )
+                # print(f"closed position, pnl: {realized_reward:.0f}")
 
-                trade_returns.append(reward)
+                # ==============================================================
+                # STORE PPO TRANSITION
+                # ==============================================================
 
-        # ==============================================================
-        # STORE PPO TRANSITION
-        # ==============================================================
-
-        agent.store_transition(
-            state_seq,
-            action,
-            logprob,
-            value,
-            reward,
-            done
-        )
+            agent.store_transition(
+                state_seq,
+                action,
+                logprob,
+                value,
+                reward,
+                done
+            )
 
         save_counter += 1
 
@@ -1060,8 +1196,8 @@ def train_bot(df, symbol="XAUUSD"):
         # WEEKLY TRAINING
         # ==============================================================
 
-        if save_counter % 672 == 0:
-
+        if save_counter % 1440 == 0:
+        # if len(agent.trajectory) >= 512:
             print(
                 f"[{symbol}] "
                 f"[INFO] Training PPO on step "
@@ -1110,20 +1246,20 @@ def train_bot(df, symbol="XAUUSD"):
                     else float("inf")
                 )
                 max_dd = max_drawdown(trade_returns)
-                R_pnl = weekly_pnl / 4 / SL_PIPS
+                R_pnl = weekly_pnl / (SL_PIPS)
 
                 print()
                 print("================================================")
                 print(f"[{symbol}] WEEKLY PPO TRAINING")
                 print("================================================")
                 print(f"Trades:          {len(trade_returns)}")
-                print(f"Weekly PnL:      {weekly_pnl/4:.2f} pips")
+                print(f"Weekly PnL:      {weekly_pnl:.0f} pips")
                 print(f"Winrate:         {winrate*100:.2f}%")
-                print(f"Mean Win:        {mean_win*4:.2f} pips")
-                print(f"Mean Loss:       {mean_loss*4:.2f} pips")
-                print(f"Max DD:          {max_dd/(SL_PIPS*4):.2f}R")
+                print(f"Mean Win:        {mean_win:.0f} pips")
+                print(f"Mean Loss:       {mean_loss:.0f} pips")
+                print(f"Max DD:          {max_dd/(SL_PIPS):.2f}R")
                 print(f"PF:              {profit_factor:.2f}")
-                print(f"Weekly R profit: {R_pnl:.2f}")
+                print(f"Weekly R PnL:    {R_pnl:.2f}R")
                 print(f"Sharpe:          {sharpe:.2f}")
                 print(f"Sortino:         {sortino:.2f}")
                 print("================================================")
@@ -1155,12 +1291,12 @@ def open_long(symbol, lot_size):
 
     sl = entry - 5
 
-    tp1 = entry + 5
-    tp2 = entry + 10
-    tp3 = entry + 15
-    tp4 = entry + 20
+    tp1 = entry + 1.12
+    # tp2 = entry + 10
+    # tp3 = entry + 15
+    # tp4 = entry + 20
 
-    tps = [tp1, tp2, tp3, tp4]
+    tps = [tp1]
 
     for tp in tps:
 
@@ -1181,7 +1317,7 @@ def open_long(symbol, lot_size):
 
         result = mt5.order_send(request)
 
-        print(result)
+        # print(result)
 
 def open_short(symbol, lot_size):
 
@@ -1191,12 +1327,12 @@ def open_short(symbol, lot_size):
 
     sl = entry + 5
 
-    tp1 = entry - 5
-    tp2 = entry - 10
-    tp3 = entry - 15
-    tp4 = entry - 20
+    tp1 = entry - 1.12
+    # tp2 = entry - 10
+    # tp3 = entry - 15
+    # tp4 = entry - 20
 
-    tps = [tp1, tp2, tp3, tp4]
+    tps = [tp1]
 
     for tp in tps:
 
@@ -1217,7 +1353,7 @@ def open_short(symbol, lot_size):
 
         result = mt5.order_send(request)
 
-        print(result)
+        # print(result)
 
 def open_positions(symbol):
     positions = mt5.positions_get(symbol=symbol)
@@ -1239,6 +1375,7 @@ def get_ppo_positions(symbol):
     ]
 
 def move_all_stops(symbol, new_sl):
+    print("in move_all_stops")
 
     positions = get_ppo_positions(symbol)
 
@@ -1260,111 +1397,68 @@ def move_all_stops(symbol, new_sl):
         )
 
 def manage_positions(symbol, SL_MOVE_BUFFER):
-
     positions = get_ppo_positions(symbol)
+
+    if not positions:
+        return
 
     count = len(positions)
 
-    if count <= 1:
-        return
-
-    positions.sort(key=lambda p: p.tp)
-
+    direction = positions[0].type
     entry = positions[0].price_open
 
     tick = mt5.symbol_info_tick(symbol)
 
-    direction = positions[0].type
-
     if direction == mt5.ORDER_TYPE_BUY:
-
         current_price = tick.bid
 
-        tp1 = positions[0].tp
+        positions.sort(key=lambda p: p.tp)
 
-        if count == 3 and current_price >= tp1 + SL_MOVE_BUFFER:
+        # TP1 hit
+        if count == 3:
+            move_all_stops(symbol, entry)
 
-            move_all_stops(
-                symbol,
-                entry
-            )
-
-        elif count == 2:
-
-            tp2 = positions[1].tp
-
-            if current_price >= tp2 + SL_MOVE_BUFFER:
-
-                move_all_stops(
-                    symbol,
-                    tp1
-                )
-
-        elif count == 1:
-
-            tp3 = positions[0].tp
-
-            if current_price >= tp3 + SL_MOVE_BUFFER:
-
-                move_all_stops(
-                    symbol,
-                    tp2
-                )
+        # TP + buffer hit
+        for pos in positions:
+            if pos.tp > 0 and current_price >= pos.tp + SL_MOVE_BUFFER:
+                move_all_stops(symbol, pos.tp)
 
     else:
-
         current_price = tick.ask
 
-        positions.sort(
-            key=lambda p: p.tp,
-            reverse=True
-        )
+        positions.sort(key=lambda p: p.tp, reverse=True)
 
-        tp1 = positions[0].tp
+        # TP1 hit
+        if count == 3:
+            move_all_stops(symbol, entry)
 
-        if count == 3 and current_price <= tp1 - SL_MOVE_BUFFER:
-
-            move_all_stops(
-                symbol,
-                entry
-            )
-
-        elif count == 2:
-
-            tp2 = positions[1].tp
-
-            if current_price <= tp2 - SL_MOVE_BUFFER:
-
-                move_all_stops(
-                    symbol,
-                    tp1
-                )
-
-        elif count == 1:
-
-            tp3 = positions[0].tp
-
-            if current_price <= tp3 - SL_MOVE_BUFFER:
-
-                move_all_stops(
-                    symbol,
-                    tp2
-                )
+        # TP + buffer hit
+        for pos in positions:
+            if pos.tp > 0 and current_price <= pos.tp - SL_MOVE_BUFFER:
+                move_all_stops(symbol, pos.tp)
 
 def test_bot(symbol="XAUUSD"):
-    SEQ_LEN = 32
+    SEQ_LEN = 12 * 3
+    
+    mt5.initialize()
     account = mt5.account_info()
-
+    # if account is None:
+    #     print("Failed to get account info")
+    #     print(mt5.last_error())
+    #     return
     balance = account.balance
-    RISK = 0.0025
+    RISK = 0.02
     # risk_per_position = max(balance * RISK / 500 / 4, 0.01)
 
-    tick = mt5.symbol_info_tick(symbol)
-    SL_PIPS = tick.bid * 0.00125 * 10
-    risk_per_position = min(
-        max(round(balance * RISK / SL_PIPS * 10 / 4, 2), 0.01),
-        100.0
-    )
+    # tick = mt5.symbol_info_tick(symbol)
+    # SL_PIPS = round(tick.bid * 0.00125 * 10, 0)
+    # risk_per_position = min(
+    #     max((balance * RISK) / (SL_PIPS * 10) / 4, 0.01),
+    #     100.0
+    # )
+    # risk_per_position = round(risk_per_position, 2)
+    # print(f"volume: {risk_per_position}")
+    # print(f"sl pips: {SL_PIPS}")
 
     FEATURES = [
         "Open",
@@ -1381,14 +1475,16 @@ def test_bot(symbol="XAUUSD"):
         "EMA_DIFF"
     ]
 
-    last_m15 = None
-    last_m1 = None
+    # last_m15 = None
+    last_m5 = None
 
     agent = LSTMPPOAgent(
         state_size=len(FEATURES),
         hidden_size=64,
-        action_size=4
+        action_size=3
     )
+
+    # agent.model.debug = True
 
     agent.loadcheckpoint("XAUUSD")
 
@@ -1396,35 +1492,54 @@ def test_bot(symbol="XAUUSD"):
     # INITIAL LOAD
     # ==========================================================
 
-    rates_m15 = mt5.copy_rates_from_pos(
+    rates_m5 = mt5.copy_rates_from_pos(
         symbol,
-        mt5.TIMEFRAME_M15,
+        mt5.TIMEFRAME_M5,
         0,
         200
     )
 
-    rates_m1 = mt5.copy_rates_from_pos(
-        symbol,
-        mt5.TIMEFRAME_M15,
-        0,
-        10
-    )
+    # rates_m1 = mt5.copy_rates_from_pos(
+    #     symbol,
+    #     mt5.TIMEFRAME_M15,
+    #     0,
+    #     500
+    # )
 
-    last_m1 = rates_m1[-1]["time"]
-    last_m15 = df.iloc[-1]["time"]
+    df = pd.DataFrame(rates_m5)
 
-    df = pd.DataFrame(rates_m15)
+    df.rename(columns={
+        'open': 'Open',
+        'high': 'High',
+        'low': 'Low',
+        'close': 'Close',
+        'time': 'Date'
+    }, inplace=True)
+
+    raw_df = df
 
     df = add_indicators(df)
 
-    last_m15 = None
-    last_m1 = None
+    # last_m1 = rates_m1[-1]["time"]
+    last_m5 = df.index[-1]
+
+    # last_m5 = None
+    # last_m1 = None
 
     # ==========================================================
     # MAIN LOOP
     # ==========================================================
 
     while True:
+
+        tick = mt5.symbol_info_tick(symbol)
+        # SL_PIPS = round(tick.bid * 0.00125 * 10, 0)
+        SL_PIPS = 50
+        risk_per_position = min(
+            max((balance * RISK) / (SL_PIPS * 10), 0.01),
+            100.0
+        )
+        risk_per_position = round(risk_per_position, 2)
 
         # ======================================================
         # MANAGE POSITIONS EVERY NEW M1 CANDLE
@@ -1443,32 +1558,41 @@ def test_bot(symbol="XAUUSD"):
 
            #  last_m1 = current_m1
 
-        manage_positions(symbol, round(SL_PIPS / 10 / 3, 2))
+        # manage_positions(symbol, round(SL_PIPS / 10 / 7, 2))
+        # print("exited manage_positions()")
 
         # ======================================================
         # CHECK FOR NEW M15 CANDLE
         # ======================================================
 
-        new_m15 = mt5.copy_rates_from_pos(
+        new_m5 = mt5.copy_rates_from_pos(
             symbol,
-            mt5.TIMEFRAME_M15,
+            mt5.TIMEFRAME_M5,
             0,
             1
         )
 
-        current_m15 = new_m15[0]["time"]
+        current_m5 = new_m5[0]["time"]
 
-        if current_m15 != last_m15:
+        if current_m5 != last_m5:
 
-            last_m15 = current_m15
+            last_m5 = current_m5
 
             # ==================================================
             # APPEND NEW CANDLE
             # ==================================================
 
-            new_row = pd.DataFrame(new_m15)
+            new_row = pd.DataFrame(new_m5)
 
-            if new_row.iloc[0]["time"] != df.iloc[-1]["time"]:
+            new_row.rename(columns={
+                'open': 'Open',
+                'high': 'High',
+                'low': 'Low',
+                'close': 'Close',
+                'time': 'Date'
+            }, inplace=True)
+
+            if new_row.index[-1] != df.index[-1]:
 
                 df = pd.concat(
                     [df, new_row],
@@ -1480,7 +1604,20 @@ def test_bot(symbol="XAUUSD"):
                     .reset_index(drop=True)
                 )
 
-                df = add_indicators(df)
+                """
+                raw_df = pd.concat(
+                    [raw_df, new_row],
+                    ignore_index=True
+                )
+
+                raw_df = raw_df.tail(200).reset_index(drop=True)
+                """
+
+                # print("Before indicators:", len(df))
+                df = add_indicators(raw_df.copy())
+                # print("After indicators:", len(df))
+                # print(df.tail())
+                # print(df.shape)
 
             # ==================================================
             # BUILD STATE SEQUENCE
@@ -1503,9 +1640,29 @@ def test_bot(symbol="XAUUSD"):
             # PPO DECISION
             # ==================================================
 
+            # print("df shape:", df.shape)
+            # print("state_seq shape:", state_seq.shape)
+            # print("len(df):", len(df))
+
+            # if len(df) < SEQ_LEN:
+            #     print(f"Skipping: len(df)={len(df)}")
+            #     continue
+
+            state_seq = (
+                df[FEATURES]
+                .tail(SEQ_LEN)
+                .values
+                .astype(np.float32)
+            )
+
+            if state_seq.shape[0] != SEQ_LEN:
+                print(f"Bad state shape: {state_seq.shape}")
+                continue
+
             action, _, _ = agent.select_action(
                 state_seq,
-                open_pos > 0
+                open_pos > 0,
+                training=False
             )
 
             # ==================================================
@@ -1518,12 +1675,12 @@ def test_bot(symbol="XAUUSD"):
 
                 balance = account.balance
 
-                risk_per_position = max(
-                    balance * RISK / 500 / 4,
-                    0.01
-                )
+                # risk_per_position = max(
+                #     balance * RISK / 500 / 4,
+                #     0.01
+                # )
 
-                if action == 2:
+                if action == 1 and df["adx"].iloc[-1] > 20 and df["+di"].iloc[-1] > df["-di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] > 0 and df["k"].iloc[-1] < 80:
 
                     # print(
                     #     f"[{symbol}] PPO BUY"
@@ -1534,7 +1691,7 @@ def test_bot(symbol="XAUUSD"):
                         risk_per_position
                     )
 
-                elif action == 3:
+                elif action == 2 and df["adx"].iloc[-1] > 20 and df["-di"].iloc[-1] > df["+di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] < 0 and df["k"].iloc[-1] > 20:
 
                     # print(
                     #     f"[{symbol}] PPO SELL"
@@ -1545,24 +1702,28 @@ def test_bot(symbol="XAUUSD"):
                         risk_per_position
                     )
 
-                else:
+                # else:
 
-                    print(
-                        f"[{symbol}] PPO HOLD"
-                    )
+                #     print(
+                #         f"[{symbol}] PPO HOLD"
+                #     )
 
         now = datetime.now()
-        sleep_seconds = 60 - now.second - now.microsecond / 1_000_000
-        time.sleep(sleep_seconds)
+
+        seconds_until_next_5m = (
+            300
+            - now.second
+            - now.microsecond / 1_000_000
+        )
+
+        if seconds_until_next_5m <= 0:
+            seconds_until_next_5m += 300
+
+        time.sleep(seconds_until_next_5m)
 
 def main():
-
-    df = load_last_mb_xauusd()
-
-    # print(f'loaded df: {df}')
-
-    df = add_indicators(df)
-
-    train_bot(df, "XAUUSD")
+    train_bot("XAUUSD")
+    
+    # test_bot(symbol="XAUUSD-VIP")
 
 main()

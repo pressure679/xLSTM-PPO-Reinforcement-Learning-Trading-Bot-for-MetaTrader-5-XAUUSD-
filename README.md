@@ -27,11 +27,11 @@ The bot can be trained on historical data and deployed for live trading through 
 Training data consists of:
 
 * XAUUSD (Gold)
-* 15-minute timeframe
+* 5-minute timeframe
 * OHLC candles
-* Historical dataset obtained from Kaggle
+* Historical dataset obtained from Kaggle - https://www.kaggle.com/datasets/novandraanugrah/xauusd-gold-price-historical-data-2004-2024
 
-The dataset is used to train the LSTM and PPO models to identify profitable trading opportunities.
+The dataset is used to train the LSTM and PPO models on 5-1 year worth of data to identify profitable trading opportunities.
 
 ---
 

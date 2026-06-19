@@ -177,14 +177,23 @@ def Indecision(df, threshold=0.2):
 
     return (body / candle_range < threshold).astype(int)
 
-def RejectionBlock(df, wick_ratio=2.0):
+def RejectionBlocks(df, wick_ratio=2.0):
     body = (df["Close"] - df["Open"]).abs()
 
-    upper = df["High"] - df[["Open","Close"]].max(axis=1)
-    lower = df[["Open","Close"]].min(axis=1) - df["Low"]
+    upper = df["High"] - df[["Open", "Close"]].max(axis=1)
+    lower = df[["Open", "Close"]].min(axis=1) - df["Low"]
 
-    return ((upper > body * wick_ratio) |
-            (lower > body * wick_ratio)).astype(int)
+    bullish_rb = (
+        (lower > body * wick_ratio) &
+        (lower > upper)
+    ).astype(int)
+
+    bearish_rb = (
+        (upper > body * wick_ratio) &
+        (upper > lower)
+    ).astype(int)
+
+    return bullish_rb, bearish_rb
 
 def BullishOB(df, multiplier=1.5):
     body = (df["Close"] - df["Open"]).abs()
@@ -288,7 +297,8 @@ def BuyScore(df):
         df["bullish_mb"] * 1 +
         df["bullish_fvg"] * 1 +
         df["eql"] * 1 +
-        df["rb"] * 1 -
+        df["bullish_rb"] * 1 -
+        df["bearish_rb"] * 1 -
         df["bearish_ob"] * 2 -
         df["bearish_fvg"] * 1 -
         df["eqh"] * 1
@@ -306,7 +316,8 @@ def SellScore(df):
         df["bearish_mb"] * 1 +
         df["bearish_fvg"] * 1 +
         df["eqh"] * 1 +
-        df["rb"] * 1 -
+        df["bearish_rb"] * 1 -
+        df["bullish_rb"] * 1 -
         df["bullish_ob"] * 2 -
         df["bullish_fvg"] * 1 -
         df["eql"] * 1
@@ -322,7 +333,6 @@ def add_indicators(df):
     df['EMA_DIFF'] = df['EMA7'] - df['EMA21']
 
     df["indecision"] = Indecision(df)
-    df["rb"] = RejectionBlock(df)
 
     df["bullish_ob"] = BullishOB(df)
     df["bearish_ob"] = BearishOB(df)
@@ -336,16 +346,17 @@ def add_indicators(df):
     df["bearish_mb"] = BearishMB(df)
     df["bullish_mb"] = BullishMB(df)
 
+    df["bullish_rb"], df["bearish_rb"] = RejectionBlocks(df)
+
     df["sell_score"] = SellScore(df)
     df["buy_score"] = BuyScore(df)
 
-    df["asia_high_dist"] = AsiaHighDist(df)
-    df["asia_low_dist"] = AsiaLowDist(df)
+    # df["asia_high_dist"] = AsiaHighDist(df)
+    # df["asia_low_dist"] = AsiaLowDist(df)
 
     df = df[["Open", "High", "Low", "Close", "k", "k_smooth", "adx", "+di", "-di", "EMA7", "EMA21", "EMA_DIFF",
-            "indecision", "rb", "bullish_ob", "bearish_ob", "bullish_fvg", "bearish_fvg", "eqh", "eql", "bearish_mb", "bullish_mb",
-            "sell_score", "buy_score",
-            "asia_high_dist", "asia_low_dist"]].copy()
+            "indecision", "bullish_ob", "bearish_ob", "bullish_fvg", "bearish_fvg", "eqh", "eql", "bearish_mb", "bullish_mb", "bullish_rb", "bearish_rb",
+            "sell_score", "buy_score"]].copy()
     # df = df[["Open", "High", "Low", "Close", "EMA_crossover", "macd_zone", "macd_line", "macd_signal", "macd_line_diff", "macd_signal_diff", "macd_line_slope", "macd_signal_line_slope" , "macd_osma", "macd_crossover", "bb_sma", "bb_upper", "bb_lower", "RSI_zone", "ADX_zone", "+DI_val", "-DI_val", "ATR", "order_block_type"]].copy()
 
     df.dropna(inplace=True)
@@ -933,7 +944,6 @@ def train_bot(symbol="XAUUSD"):
         "EMA21",
         "EMA_DIFF",
         "indecision",
-        "rb",
         "bullish_ob",
         "bearish_ob",
         "bullish_fvg",
@@ -942,10 +952,12 @@ def train_bot(symbol="XAUUSD"):
         "eql",
         "bearish_mb",
         "bullish_mb",
+        "bullish_rb",
+        "bearish_rb",
         "sell_score",
-        "buy_score",
-        "asia_high_dist",
-        "asia_low_dist"
+        "buy_score"
+        # "asia_high_dist",
+        # "asia_low_dist"
     ]
 
     agent = LSTMPPOAgent(
@@ -997,7 +1009,7 @@ def train_bot(symbol="XAUUSD"):
     trade_returns = []
 
     # STANDARD_SL_PIPS = 100
-    RR_RATIO = 0.26
+    RR_RATIO = 0.375
     # SPREAD_AND_COMMISSION = 1.2
 
     # SL_PIPS = 50
@@ -1026,8 +1038,8 @@ def train_bot(symbol="XAUUSD"):
         high = current["High"]
         low = current["Low"]
         # SL_PIPS = round(current_price * 0.00125 * 10, 0)
-        SL_PIPS = 50
-        TP1_PIPS = round(SL_PIPS * 0.26, 0)
+        SL_PIPS = 40
+        TP1_PIPS = round(SL_PIPS * RR_RATIO, 0)
         # TP2_PIPS = round(SL_PIPS * 2, 0)
         # TP3_PIPS = round(SL_PIPS * 3, 0)
         # TP4_PIPS = round(SL_PIPS * 4, 0)
@@ -1165,8 +1177,8 @@ def train_bot(symbol="XAUUSD"):
                 if not tp1_hit and high >= tp1_price:
 
                     # realized_reward += SL_PIPS - SPREAD_AND_COMMISSION
-                    pnl += SL_PIPS * 0.2 - SPREAD_AND_COMMISSION
-                    reward += SL_PIPS * 0.2 - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * RR_RATIO - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * RR_RATIO - SPREAD_AND_COMMISSION
                     position_size -= 0.25
 
                     tp1_hit = True
@@ -1272,8 +1284,8 @@ def train_bot(symbol="XAUUSD"):
                 if not tp1_hit and low <= tp1_price:
 
                     # realized_reward += SL_PIPS * 2 - SPREAD_AND_COMMISSION
-                    reward += SL_PIPS * 0.2 - SPREAD_AND_COMMISSION
-                    pnl += SL_PIPS * 0.2 - SPREAD_AND_COMMISSION
+                    reward += SL_PIPS * RR_RATIO - SPREAD_AND_COMMISSION
+                    pnl += SL_PIPS * RR_RATIO - SPREAD_AND_COMMISSION
                     # position_size -= 0.25
 
                     tp1_hit = True
@@ -1473,6 +1485,7 @@ def train_bot(symbol="XAUUSD"):
             )
             agent.train()
             agent.savecheckpoint(symbol)
+            print("Finished training PPO")
 
     # ==============================================================
     # FINAL TRAINING
@@ -1498,7 +1511,7 @@ def open_long(symbol, lot_size):
 
     sl = entry - 5
 
-    tp1 = entry + 1.3
+    tp1 = entry + 1.5
     # tp2 = entry + 10
     # tp3 = entry + 15
     # tp4 = entry + 20
@@ -1534,7 +1547,7 @@ def open_short(symbol, lot_size):
 
     sl = entry + 5
 
-    tp1 = entry - 1.3
+    tp1 = entry - 1.5
     # tp2 = entry - 10
     # tp3 = entry - 15
     # tp4 = entry - 20
@@ -1654,7 +1667,7 @@ def test_bot(symbol="XAUUSD"):
     #     print(mt5.last_error())
     #     return
     balance = account.balance
-    RISK = 0.02
+    RISK = 0.005
     # risk_per_position = max(balance * RISK / 500 / 4, 0.01)
 
     # tick = mt5.symbol_info_tick(symbol)
@@ -1681,7 +1694,6 @@ def test_bot(symbol="XAUUSD"):
         "EMA21",
         "EMA_DIFF",
         "indecision",
-        "rb",
         "bullish_ob",
         "bearish_ob",
         "bullish_fvg",
@@ -1690,10 +1702,12 @@ def test_bot(symbol="XAUUSD"):
         "eql",
         "bearish_mb",
         "bullish_mb",
+        "bullish_rb",
+        "bearish_rb",
         "sell_score",
-        "buy_score",
-        "asia_high_dist",
-        "asia_low_dist"
+        "buy_score"
+        # "asia_high_dist",
+        # "asia_low_dist"
     ]
 
     # last_m15 = None
@@ -1737,6 +1751,9 @@ def test_bot(symbol="XAUUSD"):
         'time': 'Date'
     }, inplace=True)
 
+    df["Date"] = pd.to_datetime(df["Date"], unit="s")
+    df.set_index("Date", inplace=True)
+
     raw_df = df
 
     df = add_indicators(df)
@@ -1769,7 +1786,7 @@ def test_bot(symbol="XAUUSD"):
 
         tick = mt5.symbol_info_tick(symbol)
         # SL_PIPS = round(tick.bid * 0.00125 * 10, 0)
-        SL_PIPS = 50
+        SL_PIPS = 40
         risk_per_position = min(
             max((balance * RISK) / (SL_PIPS * 10), 0.01),
             100.0
@@ -1834,21 +1851,23 @@ def test_bot(symbol="XAUUSD"):
                     ignore_index=True
                 )
 
+                df.set_index("Date", inplace=True)
+
                 df = (
                     df.tail(200)
-                    .reset_index(drop=True)
+                    # .reset_index(drop=True)
                 )
 
-                """
                 raw_df = pd.concat(
                     [raw_df, new_row],
                     ignore_index=True
                 )
 
-                raw_df = raw_df.tail(200).reset_index(drop=True)
-                """
+                # raw_df = raw_df.tail(200).reset_index(drop=True)
+                raw_df = raw_df.tail(200)
 
                 # print("Before indicators:", len(df))
+                # df = add_indicators(raw_df.copy())
                 df = add_indicators(raw_df.copy())
                 # print("After indicators:", len(df))
                 # print(df.tail())
@@ -1897,7 +1916,7 @@ def test_bot(symbol="XAUUSD"):
             action, _, _ = agent.select_action(
                 state_seq,
                 open_pos > 0,
-                training=True
+                training=False
             )
 
             if df["adx"].iloc[-1] < 20:
@@ -1922,9 +1941,9 @@ def test_bot(symbol="XAUUSD"):
 
                 # if action == 1 and df["adx"].iloc[-1] > 20 and df["+di"].iloc[-1] > df["-di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] > 0 and df["k"].iloc[-1] < 80:
                 if action == 1:
-                    print(
-                        f"[{symbol}] PPO BUY"
-                    )
+                    # print(
+                    #     f"[{symbol}] PPO BUY"
+                    # )
 
                     open_long(
                         symbol,
@@ -1933,9 +1952,9 @@ def test_bot(symbol="XAUUSD"):
 
                 # elif action == 2 and df["adx"].iloc[-1] > 20 and df["-di"].iloc[-1] > df["+di"].iloc[-1] and df["EMA_DIFF"].iloc[-1] < 0 and df["k"].iloc[-1] > 20:
                 elif action == 2:
-                    print(
-                        f"[{symbol}] PPO SELL"
-                    )
+                    # print(
+                    #     f"[{symbol}] PPO SELL"
+                    # )
 
                     open_short(
                         symbol,

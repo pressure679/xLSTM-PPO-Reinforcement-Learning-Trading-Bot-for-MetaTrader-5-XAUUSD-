@@ -301,7 +301,8 @@ def BuyScore(df):
         df["bearish_rb"] * 1 -
         df["bearish_ob"] * 2 -
         df["bearish_fvg"] * 1 -
-        df["eqh"] * 1
+        df["eqh"] * 1 - 
+        (df["k"] >= 80) * 1
     )
 
 def SellScore(df):
@@ -320,7 +321,8 @@ def SellScore(df):
         df["bullish_rb"] * 1 -
         df["bullish_ob"] * 2 -
         df["bullish_fvg"] * 1 -
-        df["eql"] * 1
+        df["eql"] * 1 -
+        (df["k"] <= 20) * 1
     )
 
 def add_indicators(df):
@@ -1509,7 +1511,7 @@ def open_long(symbol, lot_size):
 
     entry = tick.ask
 
-    sl = entry - 5
+    sl = entry - 4
 
     tp1 = entry + 1.5
     # tp2 = entry + 10
@@ -1545,7 +1547,7 @@ def open_short(symbol, lot_size):
 
     entry = tick.bid
 
-    sl = entry + 5
+    sl = entry + 4
 
     tp1 = entry - 1.5
     # tp2 = entry - 10
@@ -2149,8 +2151,8 @@ def update_xauusd_data():
 
 def main():
     # update_xauusd_data()
-    train_bot("XAUUSD")
+    # train_bot("XAUUSD")
     
-    # test_bot(symbol="XAUUSD-VIP")
+    test_bot(symbol="XAUUSD-VIP")
 
 main()

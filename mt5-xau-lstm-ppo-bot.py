@@ -24,7 +24,7 @@ ACTIONS = ['hold', 'long', 'short', 'close']
 
 # capital = 800
 
-def load_last_mb_xauusd(file_path="C:\\Users\\Vittus Mikiassen\\Desktop\\XAU_5m_data.csv", mb=20, delimiter=';', col_names=None):
+def load_last_mb_xauusd(file_path="C:\\Users\\Vittus Mikiassen\\Desktop\\XAU_5m_data.csv", mb=6, delimiter=';', col_names=None):
     file_size = os.path.getsize(file_path)
     offset = max(file_size - mb * 1024 * 1024, 0)  # start position
     
@@ -333,19 +333,6 @@ def VWAP(df, atr_period=14, atr_multiplier=1.0):
         raise ValueError("No volume column found.")
 
     # --------------------------------------------------
-    # ATR (internal only)
-    # --------------------------------------------------
-    prev_close = df["Close"].shift(1)
-
-    tr = pd.concat([
-        df["High"] - df["Low"],
-        (df["High"] - prev_close).abs(),
-        (df["Low"] - prev_close).abs()
-    ], axis=1).max(axis=1)
-
-    atr = tr.rolling(atr_period).mean()
-
-    # --------------------------------------------------
     # VWAP
     # --------------------------------------------------
     typical_price = (
@@ -361,8 +348,21 @@ def VWAP(df, atr_period=14, atr_multiplier=1.0):
 
     vwap = round(cum_tpv / cum_volume, 2)
 
-    upper = round(vwap + atr * atr_multiplier, 2)
-    lower = round(vwap - atr * atr_multiplier, 2)
+    # --------------------------------------------------
+    # Session VWAP Standard Deviation
+    # --------------------------------------------------
+
+    # Squared distance from VWAP
+    sq_diff = ((typical_price - vwap) ** 2) * volume
+
+    # Cumulative weighted variance
+    cum_sq_diff = sq_diff.groupby(session).cumsum()
+
+    variance = cum_sq_diff / cum_volume
+    stddev = variance.pow(0.5)
+
+    upper = round(vwap + stddev * atr_multiplier, 2)
+    lower = round(vwap - stddev * atr_multiplier, 2)
 
     # --------------------------------------------------
     # Derived features
@@ -1154,6 +1154,7 @@ def train_bot(symbol="XAUUSD"):
     state_buffer = deque(maxlen=SEQ_LEN)
 
     training_start_2 = time.time()
+    training_start_3 = time.time()
 
     # preload sequence
     for i in range(SEQ_LEN):
@@ -1440,6 +1441,12 @@ def train_bot(symbol="XAUUSD"):
                 print("================================================")
                 print()
 
+                print(
+                    f"[{symbol}] "
+                    f"[INFO] "
+                    f"Elapsed: {timedelta(seconds=int(time.time() - training_start_3))}"
+                )
+
                 trade_returns = []
 
                 training_start = time.time()
@@ -1463,7 +1470,7 @@ def train_bot(symbol="XAUUSD"):
                 eta = remaining * avg_time
 
                 print(
-                    f"[{symbol}] "
+                    f"[{symbol}] [INFO] "
                     f"{completed}/{total} "
                     f"({completed/total*100:.1f}%) | "
                     f"Elapsed: {timedelta(seconds=int(elapsed))} | "
@@ -1471,6 +1478,7 @@ def train_bot(symbol="XAUUSD"):
                 )
 
                 # training_start_2 = time.time()
+                training_start_3 = time.time()
 
     agent.train()
     agent.savecheckpoint(symbol)
@@ -1577,79 +1585,6 @@ def open_positions(symbol):
         if p.magic == 123456
     ]
     return len(positions)
-
-def get_ppo_positions(symbol):
-
-    positions = mt5.positions_get(symbol=symbol)
-
-    return [
-        p
-        for p in positions
-        if p.magic == 123456
-    ]
-
-def move_all_stops(symbol, new_sl):
-    print("in move_all_stops")
-
-    positions = get_ppo_positions(symbol)
-
-    for pos in positions:
-
-        request = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "position": pos.ticket,
-            "sl": new_sl,
-            "tp": pos.tp
-        }
-
-        result = mt5.order_send(request)
-
-        print(
-            f"SL moved ticket "
-            f"{pos.ticket} -> "
-            f"{new_sl}"
-        )
-
-def manage_positions(symbol, SL_MOVE_BUFFER):
-    positions = get_ppo_positions(symbol)
-
-    if not positions:
-        return
-
-    count = len(positions)
-
-    direction = positions[0].type
-    entry = positions[0].price_open
-
-    tick = mt5.symbol_info_tick(symbol)
-
-    if direction == mt5.ORDER_TYPE_BUY:
-        current_price = tick.bid
-
-        positions.sort(key=lambda p: p.tp)
-
-        # TP1 hit
-        if count == 3:
-            move_all_stops(symbol, entry)
-
-        # TP + buffer hit
-        for pos in positions:
-            if pos.tp > 0 and current_price >= pos.tp + SL_MOVE_BUFFER:
-                move_all_stops(symbol, pos.tp)
-
-    else:
-        current_price = tick.ask
-
-        positions.sort(key=lambda p: p.tp, reverse=True)
-
-        # TP1 hit
-        if count == 3:
-            move_all_stops(symbol, entry)
-
-        # TP + buffer hit
-        for pos in positions:
-            if pos.tp > 0 and current_price <= pos.tp - SL_MOVE_BUFFER:
-                move_all_stops(symbol, pos.tp)
 
 def test_bot(symbol="XAUUSD"):
     SEQ_LEN = 12 * 8
@@ -1983,186 +1918,6 @@ def test_bot(symbol="XAUUSD"):
                 #     print(
                 #         f"[{symbol}] PPO HOLD"
                 #     )
-
-CSV_FILE = "XAU_5m_data.csv"
-
-def get_last_date():
-
-    if not os.path.exists(CSV_FILE):
-        return None
-
-    df = pd.read_csv(
-        CSV_FILE,
-        sep=";"
-    )
-
-    if df.empty:
-        return None
-
-    return pd.to_datetime(
-        df["Date"].iloc[-1]
-    )
-
-def download_xauusd_data():
-
-    last_date = get_last_date()
-
-    if (
-        last_date is not None
-        and (
-            datetime.now().date()
-            - last_date.date()
-        ).days <= 90
-    ):
-
-        print(
-            "Data already up to date."
-        )
-
-        return None
-
-    if last_date is None:
-
-        start_date = (
-            datetime.now()
-            - timedelta(days=365 * 5)
-        ).strftime(
-            "%Y-%m-%d"
-        )
-
-    else:
-
-        start_date = (
-            last_date
-            - timedelta(days=1)
-        ).strftime(
-            "%Y-%m-%d"
-        )
-
-    end_date = (
-        datetime.now()
-        - timedelta(days=1)
-    ).strftime(
-        "%Y-%m-%d"
-    )
-
-    print(
-        f"Downloading "
-        f"{start_date} -> {end_date}"
-    )
-
-    subprocess.run(
-        [
-            # "npx",
-            "dukascopy-node",
-            "-i",
-            "xauusd",
-            "-from",
-            start_date,
-            "-to",
-            end_date,
-            "-t",
-            "m5",
-            "-f",
-            "csv"
-        ],
-        check=True
-    )
-
-    files = [
-        f
-        for f in os.listdir(".")
-        if f.startswith("xauusd")
-        and f.endswith(".csv")
-    ]
-
-    if not files:
-
-        raise FileNotFoundError(
-            "No Dukascopy CSV was downloaded."
-        )
-
-    return max(
-        files,
-        key=os.path.getmtime
-    )
-
-def append_xauusd_data(downloaded_file):
-
-    if downloaded_file is None:
-        return
-
-    new_df = pd.read_csv(
-        downloaded_file
-    )
-
-    new_df.rename(
-        columns={
-            "timestamp": "Date",
-            "open": "Open",
-            "high": "High",
-            "low": "Low",
-            "close": "Close",
-            "volume": "Volume"
-        },
-        inplace=True
-    )
-
-    if os.path.exists(CSV_FILE):
-
-        old_df = pd.read_csv(
-            CSV_FILE,
-            sep=";"
-        )
-
-        df = pd.concat(
-            [
-                old_df,
-                new_df
-            ],
-            ignore_index=True
-        )
-
-    else:
-
-        df = new_df
-
-    df.drop_duplicates(
-        subset=["Date"],
-        keep="last",
-        inplace=True
-    )
-
-    df.sort_values(
-        "Date",
-        inplace=True
-    )
-
-    df.to_csv(
-        CSV_FILE,
-        sep=";",
-        index=False
-    )
-
-    os.remove(
-        downloaded_file
-    )
-
-    print(
-        f"Saved "
-        f"{len(df)} candles "
-        f"to {CSV_FILE}"
-    )
-
-def update_xauusd_data():
-
-    downloaded_file = (
-        download_xauusd_data()
-    )
-
-    append_xauusd_data(
-        downloaded_file
-    )
 
 def main():
 

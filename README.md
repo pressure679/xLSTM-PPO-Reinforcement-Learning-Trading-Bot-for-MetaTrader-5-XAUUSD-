@@ -119,19 +119,19 @@ pip install MetaTrader5 pandas numpy torch
 Train:
 
 ```bash
-python mt5-xau-lstm-ppo-stoch-adx-bot.py --train
+python mt5-xau-lstm-ppo-bot.py --train
 ```
 
 Live trading:
 
 ```bash
-python mt5-xau-lstm-ppo-stoch-adx-bot.py --test
+python mt5-xau-lstm-ppo-bot.py --test
 ```
 
 Train and trade simultaneously:
 
 ```bash
-python mt5-xau-lstm-ppo-stoch-adx-bot.py --train --test
+python mt5-xau-lstm-ppo-bot.py --train --test
 ```
 
 ---

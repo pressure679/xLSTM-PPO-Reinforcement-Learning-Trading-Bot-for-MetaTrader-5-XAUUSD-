@@ -42,7 +42,9 @@ The bot automatically detects:
 - Asia Low
 - Trend Lines
 - Liquidity Sweeps
-
+- BoS
+- Trends
+- CHoCHs
 ---
 
 ## Technical Indicators

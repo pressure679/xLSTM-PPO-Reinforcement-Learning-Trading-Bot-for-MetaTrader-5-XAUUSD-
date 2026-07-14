@@ -87,7 +87,6 @@ Key constants (edit in-file — there's no config file):
 |---|---|---|
 | `SEQ_LEN` | `train_bot`, `test_bot` | LSTM lookback window, in bars |
 | `TP_PIPS` / `BASE_SL_PIPS` | `train_bot`, `test_bot` | Fixed take-profit / base stop-loss |
-| `TARGET_RF` / `MIN_SL_SCALE` | `train_bot`, `test_bot` | Recovery-factor stop-loss throttle |
 | `save_count` | `train_bot` | Bars per simulated "week" (report/train/checkpoint cadence) |
 | `magic=123456` | throughout | MT5 order/position tag identifying this EA's trades |
 

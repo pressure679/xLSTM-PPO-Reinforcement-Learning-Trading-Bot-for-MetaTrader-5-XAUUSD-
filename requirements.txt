@@ -1,5 +1,5 @@
 pandas
 numpy
-torch
+pytorch
 MetaTrader5
 xgboost

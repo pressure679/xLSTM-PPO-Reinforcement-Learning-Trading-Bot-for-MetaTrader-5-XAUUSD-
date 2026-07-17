@@ -3263,7 +3263,7 @@ def test_bot(symbol="XAUUSD"):
                 print(f"Bad state shape: {state_seq.shape}")
                 continue
 
-            result = agent.select_action(state_seq, open_pos > 0, training=True)
+            result = agent.select_action(state_seq, open_pos > 0, training=False)
 
             if result is None:
                 continue

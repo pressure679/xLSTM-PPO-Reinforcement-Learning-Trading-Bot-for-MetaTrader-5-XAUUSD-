@@ -2,3 +2,4 @@ pandas
 numpy
 torch
 MetaTrader5
+xgboost
